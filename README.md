@@ -1,83 +1,118 @@
 ## Архитектура
 
-Система состоит из двух типов процессов:
+Система поддерживает два режима работы:
+- **Single-Leader** (ДЗ №2): один лидер, запись только через него
+- **Multi-Leader** (ДЗ №3): несколько лидеров, запись через любого из них, LWW-разрешение конфликтов
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         CLI / Controller                         │
-│  - Управление кластером (add/remove nodes, set leader)          │
-│  - Настройка репликации (mode, RF, K, delay)                    │
-│  - Пользовательские команды (put/get/dump)                      │
+│  - Управление кластером (add/remove nodes, set leader/mode)     │
+│  - Настройка репликации (mode, topology, RF, K, delay)          │
+│  - Пользовательские команды (put/get/dump/getAll/clusterDump)   │
 │  - Бенчмарки                                                    │
 └─────────────────────────────────────────────────────────────────┘
-                              │ TCP
-          ┌───────────────────┼───────────────────┐
-          ▼                   ▼                   ▼
-   ┌────────────┐      ┌────────────┐      ┌────────────┐
-   │  Node A    │      │  Node B    │      │  Node C    │
-   │  (LEADER)  │─────▶│ (follower) │      │ (follower) │
-   │            │─────────────────────────▶│            │
-   │ Map<K,V>   │      │ Map<K,V>   │      │ Map<K,V>   │
-   └────────────┘      └────────────┘      └────────────┘
-         │                   │                   │
-         └───────────────────┴───────────────────┘
-                    Репликация (REPL_PUT → ACK)
+                              │ TCP (JSON Lines)
+     ┌────────┬────────┬──────┼──────┬────────┬────────┐
+     ▼        ▼        ▼      ▼      ▼        ▼        ▼  ...
+  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐
+  │  L1  │ │  L2  │ │  L3  │ │  L4  │ │  F1  │ │  F2  │  ...
+  │LEADER│ │LEADER│ │LEADER│ │LEADER│ │FOLLOW│ │FOLLOW│
+  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘ └──────┘
+       ↕         ↕         ↕         ↕
+       Репликация по топологии (mesh/ring/star)
 ```
 
 ### Node (Узел хранилища)
-- In-memory хранилище `Map<String, String>`
+- In-memory хранилище `Map<String, String>` с версионированием (Lamport clock)
 - TCP сервер для приёма запросов
 - Поддержка ролей: Leader и Follower
-- Репликация операций на Followers
+- Репликация по топологии (mesh, ring, star)
+- LWW (Last Write Wins) разрешение конфликтов
 - Очередь pending операций с ретраями
 - Дедупликация операций по `operationId` с TTL 5 минут
 
 ### CLI (Cluster Controller)
-- Управление составом кластера (add/remove nodes)
-- Назначение лидера
-- Настройка параметров репликации
-- Выполнение пользовательских команд (put/get/dump)
+- Управление составом кластера и режимами
+- Назначение лидеров и топологий
+- Выполнение пользовательских команд
+- Отладочные команды (getAll, clusterDump)
 - Запуск бенчмарков
 
-## Режимы репликации
+## Режимы работы
 
-| Режим | Поведение | Latency | Consistency |
-|-------|-----------|---------|-------------|
-| **Async** | Лидер отвечает сразу, репликация в фоне | Низкая | Eventual |
-| **Sync** | Лидер ждёт ACK от (RF-1) followers | Высокая | Strong |
-| **Semi-Sync** | Лидер ждёт K ACK, догоняет в фоне | Средняя | Partial |
+### mode=single (ДЗ №2)
+- Один лидер, запись только через него
+- Follower возвращает `NOT_LEADER`
+- Режимы репликации: async, sync, semi-sync
+- Replication Factor (RF), Semi-sync ACKs (K)
 
-### Async
-- Лидер отвечает клиенту сразу после локального применения
-- Репликация идёт в фоне
-- Максимальная производительность, но возможны stale reads
+### mode=multi (ДЗ №3)
+- Несколько лидеров (4 leader + 6 follower в стандартной конфигурации)
+- Follower возвращает `NOT_LEADER_FOR_WRITE` с `leaderNodeId`
+- Версионирование через Lamport Clock
+- LWW конфликт-резолюшн
+- Топологии: mesh, ring, star
+- Eventual consistency
 
-### Sync
-- Лидер ждёт ACK от (RF-1) followers
-- Запись считается успешной только при получении нужного количества подтверждений
-- Гарантия консистентности, но выше latency
+## Lamport Clock
 
-### Semi-Sync
-- Лидер ждёт ACK от K followers (где 1 ≤ K ≤ RF-1)
-- После получения K ACK возвращает OK клиенту
-- Продолжает догонять оставшиеся реплики в фоне
-- Компромисс между Sync и Async
+Каждый узел имеет локальный счётчик `lamportCounter: long`.
 
-## Параметры
+**При локальном PUT на leader:**
+```
+L := L + 1
+version := (L, currentNodeId)
+```
 
-- **RF (Replication Factor)** - целевое количество узлов, на которые должна быть доставлена запись (включая лидера)
-- **K (semiSyncAcks)** - количество followers, после ACK от которых возвращается OK в режиме semi-sync
+**При получении REPL_PUT с версией (remoteLamport, remoteNodeId):**
+```
+L := max(L, remoteLamport) + 1
+```
 
-### Валидация параметров
-- `RF <= clusterSize` (иначе ошибка)
-- При `semi-sync`: `1 <= K <= RF-1` (иначе ошибка)
-- При `K = RF-1` semi-sync эквивалентен sync
+В хранилище сохраняется **пришедшая версия**, а не новая локальная.
+
+## Разрешение конфликтов (LWW)
+
+Сравнение версий `(lamport, nodeId)`:
+```
+(l1, n1) > (l2, n2) если l1 > l2 ИЛИ (l1 == l2 И n1 > n2)
+```
+
+При применении входящей версии:
+- Если ключа нет — сохранить
+- Если `incoming.version > local.version` — заменить
+- Иначе — проигнорировать
+
+## Топологии репликации
+
+### Mesh
+Лидер после PUT рассылает `REPL_PUT` **всем остальным узлам** напрямую. Другие узлы не форвардят.
+- Быстрое схождение (1 хоп)
+- Большой сетевой трафик
+
+### Ring
+Узлы образуют кольцо (порядок по сортировке `nodeId`). Каждый узел знает своего `next` и пересылает обновление только ему. Дедупликация предотвращает бесконечное хождение.
+- Медленное схождение (N-1 хопов)
+- Минимальный трафик
+- Чувствителен к разрыву (падение узла без removeNode)
+
+### Star
+Центральный узел (`setStarCenter <nodeId>`) — хаб для всех сообщений.
+- Нецентральный лидер → отправляет в центр → центр рассылает всем
+- Центральный лидер → рассылает всем напрямую
+- Single point of failure при падении центра
+
+## Семантика записи на Follower
+
+**Single mode:** follower возвращает `NOT_LEADER` с указанием лидера.
+
+**Multi mode:** follower возвращает `NOT_LEADER_FOR_WRITE` с `leaderNodeId`.
 
 ## Сетевой протокол
 
 ### Транспорт
-- TCP сокеты
-- JSON Lines: одно JSON сообщение на строку, завершается `\n`
+- TCP сокеты, JSON Lines (одно JSON сообщение на строку + `\n`)
 
 ### Типы сообщений
 | Тип | Направление | Описание |
@@ -87,184 +122,119 @@
 | `CLIENT_DUMP` | CLI → Node | Дамп всех данных |
 | `RESPONSE` | Node → CLI | Ответ на запрос |
 | `CLUSTER_UPDATE` | CLI → Node | Обновление конфигурации |
-| `REPL_PUT` | Leader → Follower | Репликация записи |
-| `REPL_ACK` | Follower → Leader | Подтверждение репликации |
+| `REPL_PUT` | Node → Node | Репликация записи |
+| `REPL_ACK` | Node → Node | Подтверждение репликации |
 
-### Формат сообщений
-
-**Клиентский запрос:**
+### REPL_PUT (multi mode)
 ```json
 {
-  "type": "CLIENT_PUT",
-  "requestId": "uuid",
-  "clientId": "client-1",
-  "key": "mykey",
-  "value": "myvalue"
+  "type": "REPL_PUT",
+  "operationId": "uuid",
+  "originNodeId": "L1",
+  "sourceNodeId": "L1",
+  "key": "x",
+  "value": "hello",
+  "version": { "lamport": 5, "nodeId": "L1" }
 }
 ```
 
-**Успешный ответ:**
+### REPL_ACK
 ```json
 {
-  "type": "RESPONSE",
-  "requestId": "uuid",
-  "status": "OK",
-  "key": "mykey",
-  "value": "myvalue"
-}
-```
-
-**Ошибка:**
-```json
-{
-  "type": "RESPONSE",
-  "requestId": "uuid",
-  "status": "ERROR",
-  "errorCode": "NOT_LEADER",
-  "errorMessage": "This node is not the leader",
-  "leaderNodeId": "A"
+  "type": "REPL_ACK",
+  "operationId": "uuid",
+  "fromNodeId": "F1"
 }
 ```
 
 ### Коды ошибок
 | Код | Описание |
 |-----|----------|
-| `NOT_LEADER` | Запись на follower (возвращает leaderNodeId) |
-| `NOT_ENOUGH_REPLICAS` | Не удалось получить достаточно ACK |
+| `NOT_LEADER` | Запись на follower в single mode |
+| `NOT_LEADER_FOR_WRITE` | Запись на follower в multi mode |
+| `NOT_ENOUGH_REPLICAS` | Не хватает ACK (sync/semi-sync) |
 | `TIMEOUT` | Таймаут операции |
 | `BAD_REQUEST` | Некорректный запрос |
-| `UNKNOWN_NODE` | Неизвестный узел |
-
-## Семантика записи на Follower
-
-**Redirect (NOT_LEADER)** - follower возвращает ошибку с указанием лидера, клиент должен переотправить запрос на лидера.
+| `INVALID_MODE` | Некорректный режим |
+| `INVALID_TOPOLOGY` | Некорректная топология |
 
 ## Идемпотентность
 
-Каждая операция репликации имеет уникальный `operationId`. Followers хранят `seenOpIds` с TTL 5 минут:
-- Если `opId` уже встречался - операция игнорируется
+Каждая операция репликации имеет уникальный `operationId`. Узлы хранят `seenOpIds` с TTL 5 минут:
+- Если `opId` уже встречался — операция не применяется повторно и не форвардится
 - ACK отправляется повторно
 - Периодическая очистка устаревших `opId`
+
+## Задержка репликации
+
+`setReplicationDelayMs <min> <max>` добавляет случайную задержку **перед отправкой** репликационного сообщения на стороне отправителя.
 
 ## Сборка
 
 ```bash
 ./gradlew build
+./gradlew nodeJar cliJar
 ```
 
 ## Запуск
 
-### Быстрый старт (Windows)
-
-1. **Запуск кластера:**
+### Запуск узлов
 ```bash
-start-cluster.bat
-```
+# Через JAR
+java -jar build/libs/kv-node-1.0-SNAPSHOT.jar L1 5001
+java -jar build/libs/kv-node-1.0-SNAPSHOT.jar L2 5002
+# ... и т.д.
 
-2. **Запуск CLI:**
-```bash
-start-cli.bat
-```
-
-3. **Остановка кластера:**
-```bash
-stop-cluster.bat
-```
-
-### Ручной запуск
-
-**Запуск узла:**
-```bash
 # Через Gradle
-./gradlew runNode --args="A 5001"
-./gradlew runNode --args="B 5002"
-./gradlew runNode --args="C 5003"
-
-# Или через JAR
-./gradlew nodeJar cliJar
-java -jar build/libs/kv-node-1.0-SNAPSHOT.jar A 5001
+./gradlew runNode --args="L1 5001"
 ```
 
-**Запуск CLI:**
+### Запуск CLI
 ```bash
-./gradlew runCli
-# или
 java -jar build/libs/kv-cli-1.0-SNAPSHOT.jar
+# или
+./gradlew runCli
 ```
 
 ## Команды CLI
 
 ### Управление кластером
 ```
-addNode <nodeId> <host> <port>    # Добавить узел
-removeNode <nodeId>               # Удалить узел
-listNodes                         # Список узлов
-setLeader <nodeId>                # Назначить лидера
-setReplication async|semi-sync|sync  # Режим репликации
-setRF <int>                       # Replication Factor
-setSemiSyncAcks <int>             # K для semi-sync
-setReplicationDelayMs <min> <max> # Задержка репликации
-status                            # Статус кластера
+addNode <nodeId> <host> <port>      # Добавить узел
+removeNode <nodeId>                 # Удалить узел
+listNodes                           # Список узлов
+setLeader <nodeId>                  # Назначить лидера (single mode)
+setMode single|multi                # Режим работы
+setTopology mesh|ring|star          # Топология (multi mode)
+setStarCenter <nodeId>              # Центр звезды (star topology)
+setLeaders <id1> [id2] ...         # Назначить лидеров (multi mode)
+setReplication async|semi-sync|sync # Режим репликации (single mode)
+setRF <int>                         # Replication Factor (single mode)
+setSemiSyncAcks <int>               # K для semi-sync
+setReplicationDelayMs <min> <max>   # Задержка репликации
+status                              # Статус кластера
 ```
 
 ### Пользовательские команды
 ```
 put <key> <value> [--target <nodeId>]  # Записать
 get <key> [--target <nodeId>]          # Прочитать
-dump [--target <nodeId>]               # Дамп данных
+dump [--target <nodeId>]               # Дамп данных узла
+```
+
+### Отладочные команды
+```
+getAll <key>                        # GET на все узлы (value + version)
+clusterDump                         # DUMP на все узлы
 ```
 
 ### Бенчмарки
 ```
 benchmark --threads 16 --ops 100 --put-ratio 0.5
-benchmark --run-all --output benchmarks/results.csv
+benchmark --run-all                 # Single-leader сценарии (18 прогонов)
+benchmark --run-all-multi           # Multi-leader сценарии (12 прогонов)
+benchmark --key-space 5             # Маленький keySpace для конфликтов
 benchmark --help
-```
-
-## Примеры использования
-
-### Базовый сценарий
-```
-> addNode A localhost 5001
-Node A added at localhost:5001
-
-> addNode B localhost 5002
-Node B added at localhost:5002
-
-> addNode C localhost 5003
-Node C added at localhost:5003
-
-> setLeader A
-Leader set to A
-
-> setReplication sync
-Replication mode set to SYNC
-
-> setRF 3
-Replication factor set to 3
-
-> put mykey myvalue
-OK
-
-> get mykey --target B
-mykey = myvalue
-
-> dump
-Data (1 entries):
-  mykey = myvalue
-```
-
-### Демонстрация stale read (async)
-```
-> setReplication async
-> setReplicationDelayMs 2000 3000
-> put newkey newvalue
-OK
-> get newkey --target B
-(nil)  # данные ещё не доехали
-# через 2-3 секунды
-> get newkey --target B
-newkey = newvalue
 ```
 
 ## Структура проекта
@@ -273,35 +243,27 @@ newkey = newvalue
 src/main/kotlin/com/yasashny/slreplication/
 ├── common/
 │   ├── model/
-│   │   └── Messages.kt          # Модели данных, JSON протокол
+│   │   └── Messages.kt              # Модели, протокол, Version, LWW
 │   └── network/
-│       ├── TcpServer.kt         # TCP сервер
-│       └── TcpClient.kt         # TCP клиент, пул соединений
+│       ├── TcpServer.kt             # TCP сервер
+│       └── TcpClient.kt             # TCP клиент, пул соединений
 ├── node/
-│   ├── Node.kt                  # Главный класс узла
-│   ├── NodeMain.kt              # Точка входа Node
+│   ├── Node.kt                      # Узел: single/multi, Lamport clock, LWW
+│   ├── NodeMain.kt                  # Точка входа Node
 │   ├── storage/
-│   │   └── KeyValueStore.kt     # In-memory хранилище
+│   │   └── KeyValueStore.kt         # Хранилище с версионированием
 │   └── replication/
-│       ├── ReplicationManager.kt      # Менеджер репликации
-│       └── OperationDeduplicator.kt   # Дедупликация операций
+│       ├── ReplicationManager.kt    # Репликация: single + multi + топологии
+│       └── OperationDeduplicator.kt # Дедупликация с TTL
 └── cli/
-    ├── CliMain.kt               # Интерактивный CLI
-    ├── ClusterManager.kt        # Управление кластером
-    └── Benchmark.kt             # Бенчмарки
+    ├── CliMain.kt                   # Интерактивный CLI
+    ├── ClusterManager.kt            # Управление кластером
+    └── Benchmark.kt                 # Бенчмарки single + multi
 
 benchmarks/
-└── results.csv                  # Результаты бенчмарков
+├── results.csv                      # Single-leader результаты
+└── results-multi.csv                # Multi-leader результаты
 
-demo-scenario.md                 # Демонстрационные сценарии
-report.md                        # Отчёт по бенчмаркам
-```
-
-## Бенчмарки
-
-Результаты бенчмарков сохраняются в `benchmarks/results.csv`.
-
-### Запуск всех сценариев
-```
-> benchmark --run-all --output benchmarks/results.csv
+demo-scenario.md                     # Демонстрационные сценарии
+report.md                            # Отчёт по бенчмаркам
 ```

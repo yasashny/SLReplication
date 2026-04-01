@@ -10,6 +10,8 @@ import com.yasashny.slreplication.node.replication.ReplicationManager
 import com.yasashny.slreplication.node.replication.ReplicationResult
 import com.yasashny.slreplication.node.storage.KeyValueStore
 import org.slf4j.LoggerFactory
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 class Node(
     val nodeId: String,
@@ -19,6 +21,7 @@ class Node(
     private val store = KeyValueStore()
     private val deduplicator = OperationDeduplicator()
     private val connectionPool = ConnectionPool()
+    private val lamportClock = AtomicLong(0)
 
     @Volatile
     private var config = ClusterConfig()
@@ -60,10 +63,10 @@ class Node(
     private fun handleIncomingMessage(message: Message) {
         when (message.type) {
             MessageType.REPL_ACK -> {
-                message.operationId?.let { opId ->
-                    message.originNodeId?.let { fromNode ->
-                        replicationManager.handleAck(opId, fromNode)
-                    }
+                val opId = message.operationId ?: message.operationId
+                val from = message.fromNodeId ?: message.originNodeId
+                if (opId != null && from != null) {
+                    replicationManager.handleAck(opId, from)
                 }
             }
             else -> {
@@ -71,7 +74,6 @@ class Node(
             }
         }
     }
-
 
     private suspend fun handleMessage(message: Message, sender: MessageSender) {
         logger.info("Received message: type={}, requestId={}", message.type, message.requestId)
@@ -89,6 +91,8 @@ class Node(
         }
     }
 
+    // ========== PUT ==========
+
     private suspend fun handlePut(message: Message, sender: MessageSender) {
         val key = message.key
         val value = message.value
@@ -100,45 +104,76 @@ class Node(
             sender.send(errorResponse(message, ErrorCode.BAD_REQUEST, "Value is required"))
             return
         }
-        if (!isLeader()) {
-            logger.warn("NOT_LEADER: nodeId=$nodeId, config.leaderId=${config.leaderId}")
-            sender.send(
-                Message(
-                    type = MessageType.RESPONSE,
-                    requestId = message.requestId,
-                    status = "ERROR",
-                    errorCode = ErrorCode.NOT_LEADER,
-                    errorMessage = "This node is not the leader",
-                    leaderNodeId = config.leaderId
-                )
-            )
+
+        if (config.mode == ClusterMode.MULTI) {
+            handleMultiPut(key, value, message, sender)
+        } else {
+            handleSinglePut(key, value, message, sender)
+        }
+    }
+
+    private suspend fun handleSinglePut(key: String, value: String, message: Message, sender: MessageSender) {
+        if (!isLeaderSingle()) {
+            sender.send(Message(
+                type = MessageType.RESPONSE,
+                requestId = message.requestId,
+                status = "ERROR",
+                errorCode = ErrorCode.NOT_LEADER,
+                errorMessage = "This node is not the leader",
+                leaderNodeId = config.leaderId
+            ))
             return
         }
         store.put(key, value)
         logger.debug("Applied PUT locally: $key = $value")
+
         when (val result = replicationManager.replicatePut(key, value)) {
             is ReplicationResult.Success -> {
-                sender.send(
-                    Message(
-                        type = MessageType.RESPONSE,
-                        requestId = message.requestId,
-                        status = "OK"
-                    )
-                )
+                sender.send(Message(
+                    type = MessageType.RESPONSE, requestId = message.requestId, status = "OK"
+                ))
             }
             is ReplicationResult.Error -> {
-                sender.send(
-                    Message(
-                        type = MessageType.RESPONSE,
-                        requestId = message.requestId,
-                        status = "ERROR",
-                        errorCode = result.code,
-                        errorMessage = result.message
-                    )
-                )
+                sender.send(Message(
+                    type = MessageType.RESPONSE, requestId = message.requestId,
+                    status = "ERROR", errorCode = result.code, errorMessage = result.message
+                ))
             }
         }
     }
+
+    private suspend fun handleMultiPut(key: String, value: String, message: Message, sender: MessageSender) {
+        if (!isLeaderMulti()) {
+            val suggestedLeader = config.leaderNodeIds.randomOrNull()
+            sender.send(Message(
+                type = MessageType.RESPONSE,
+                requestId = message.requestId,
+                status = "ERROR",
+                errorCode = ErrorCode.NOT_LEADER_FOR_WRITE,
+                errorMessage = "This node is not a leader in multi-leader mode",
+                leaderNodeId = suggestedLeader
+            ))
+            return
+        }
+
+        val operationId = UUID.randomUUID().toString()
+        val newLamport = lamportClock.incrementAndGet()
+        val version = Version(newLamport, nodeId)
+
+        // Register in dedup to prevent re-application from ring forwarding
+        deduplicator.isDuplicate(operationId)
+
+        store.putVersioned(key, value, version)
+        logger.debug("Multi PUT locally: $key=$value, v=($newLamport,$nodeId), opId=$operationId")
+
+        replicationManager.replicateMulti(operationId, key, value, version, nodeId)
+
+        sender.send(Message(
+            type = MessageType.RESPONSE, requestId = message.requestId, status = "OK"
+        ))
+    }
+
+    // ========== GET ==========
 
     private suspend fun handleGet(message: Message, sender: MessageSender) {
         val key = message.key
@@ -147,29 +182,39 @@ class Node(
             return
         }
         val value = store.get(key)
-        sender.send(
-            Message(
-                type = MessageType.RESPONSE,
-                requestId = message.requestId,
-                status = "OK",
-                key = key,
-                value = value
-            )
-        )
+        val version = if (config.mode == ClusterMode.MULTI) store.getVersion(key) else null
+        sender.send(Message(
+            type = MessageType.RESPONSE,
+            requestId = message.requestId,
+            status = "OK",
+            key = key,
+            value = value,
+            version = version
+        ))
     }
+
+    // ========== DUMP ==========
 
     private suspend fun handleDump(message: Message, sender: MessageSender) {
-        val data = store.dump()
-
-        sender.send(
-            Message(
+        if (config.mode == ClusterMode.MULTI) {
+            sender.send(Message(
                 type = MessageType.RESPONSE,
                 requestId = message.requestId,
                 status = "OK",
-                data = data
-            )
-        )
+                data = store.dump(),
+                versionedData = store.dumpVersioned()
+            ))
+        } else {
+            sender.send(Message(
+                type = MessageType.RESPONSE,
+                requestId = message.requestId,
+                status = "OK",
+                data = store.dump()
+            ))
+        }
     }
+
+    // ========== CLUSTER UPDATE ==========
 
     private suspend fun handleClusterUpdate(message: Message, sender: MessageSender) {
         val newConfig = message.clusterConfig
@@ -177,17 +222,17 @@ class Node(
             sender.send(errorResponse(message, ErrorCode.BAD_REQUEST, "Cluster config is required"))
             return
         }
-        logger.info("Received cluster update: nodes=${newConfig.nodes.map { it.nodeId }}, leader=${newConfig.leaderId}, " +
-                "mode=${newConfig.replicationMode}, RF=${newConfig.replicationFactor}, K=${newConfig.semiSyncAcks}")
+        logger.info("Cluster update: nodes=${newConfig.nodes.map { it.nodeId }}, mode=${newConfig.mode}, " +
+                "leader=${newConfig.leaderId}, leaders=${newConfig.leaderNodeIds}, topology=${newConfig.topology}")
         config = newConfig
-        sender.send(
-            Message(
-                type = MessageType.CLUSTER_UPDATE_ACK,
-                requestId = message.requestId,
-                status = "OK"
-            )
-        )
+        sender.send(Message(
+            type = MessageType.CLUSTER_UPDATE_ACK,
+            requestId = message.requestId,
+            status = "OK"
+        ))
     }
+
+    // ========== REPLICATION ==========
 
     private fun handleReplicationPut(message: Message) {
         val operationId = message.operationId
@@ -205,33 +250,68 @@ class Node(
             sendAck(operationId, originNodeId)
             return
         }
-        store.put(key, value)
-        logger.debug("Applied replicated PUT: $key = $value (opId=$operationId)")
 
-        sendAck(operationId, originNodeId)
+        if (config.mode == ClusterMode.MULTI) {
+            handleMultiReplicationPut(message, operationId, key, value, originNodeId)
+        } else {
+            store.put(key, value)
+            logger.debug("Applied replicated PUT: $key = $value (opId=$operationId)")
+            sendAck(operationId, originNodeId)
+        }
     }
 
-    private fun sendAck(operationId: String, leaderNodeId: String) {
-        val client = getConnection(leaderNodeId) ?: return
-        val ack = Message(
-            type = MessageType.REPL_ACK,
-            operationId = operationId,
-            originNodeId = nodeId
-        )
-        if (client.send(ack)) {
-            logger.debug("Sent ACK for opId=$operationId to $leaderNodeId")
-        } else {
-            logger.warn("Failed to send ACK for opId=$operationId to $leaderNodeId")
+    private fun handleMultiReplicationPut(
+        message: Message, operationId: String, key: String, value: String, originNodeId: String
+    ) {
+        val version = message.version
+        if (version == null) {
+            logger.warn("Multi REPL_PUT missing version: opId=$operationId")
+            return
         }
+
+        // Update Lamport clock: L = max(L, remoteLamport) + 1
+        lamportClock.updateAndGet { current -> maxOf(current, version.lamport) + 1 }
+
+        // Apply using LWW
+        val applied = store.putVersioned(key, value, version)
+        if (applied) {
+            logger.debug("Applied multi replicated PUT: $key=$value, v=(${version.lamport},${version.nodeId})")
+        } else {
+            logger.debug("Rejected older version for $key: v=(${version.lamport},${version.nodeId})")
+        }
+
+        sendAck(operationId, originNodeId)
+
+        // Forward based on topology
+        val sourceNodeId = message.sourceNodeId ?: originNodeId
+        replicationManager.forwardMulti(operationId, key, value, version, originNodeId, sourceNodeId)
     }
 
     private fun handleReplicationAck(message: Message) {
         val operationId = message.operationId ?: return
-        val fromNodeId = message.originNodeId ?: return
+        val fromNodeId = message.fromNodeId ?: message.originNodeId ?: return
         replicationManager.handleAck(operationId, fromNodeId)
     }
 
-    private fun isLeader(): Boolean = config.leaderId == nodeId
+    private fun sendAck(operationId: String, targetNodeId: String) {
+        val client = getConnection(targetNodeId) ?: return
+        val ack = Message(
+            type = MessageType.REPL_ACK,
+            operationId = operationId,
+            fromNodeId = nodeId
+        )
+        if (client.send(ack)) {
+            logger.debug("Sent ACK for opId=$operationId to $targetNodeId")
+        } else {
+            logger.warn("Failed to send ACK for opId=$operationId to $targetNodeId")
+        }
+    }
+
+    // ========== Helpers ==========
+
+    private fun isLeaderSingle(): Boolean = config.leaderId == nodeId
+
+    private fun isLeaderMulti(): Boolean = nodeId in config.leaderNodeIds
 
     private fun errorResponse(request: Message, errorCode: ErrorCode, errorMessage: String) = Message(
         type = MessageType.RESPONSE,
