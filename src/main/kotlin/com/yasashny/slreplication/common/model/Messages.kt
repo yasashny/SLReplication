@@ -4,7 +4,11 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
 enum class ClusterMode {
-    SINGLE, MULTI
+    SINGLE, MULTI, LEADERLESS
+}
+
+enum class WriteQuorumMode {
+    STRICT, SLOPPY
 }
 
 enum class Topology {
@@ -27,6 +31,24 @@ enum class MessageType {
     REPL_PUT,
     REPL_ACK,
 
+    REPL_WRITE,
+    REPL_WRITE_ACK,
+    READ_QUERY,
+    READ_RESPONSE,
+    CLIENT_DUMP_HINTS,
+    HINTED_HANDOFF_TRANSFER,
+    HINTED_HANDOFF_ACK,
+    MERKLE_ROOT_REQUEST,
+    MERKLE_ROOT_RESPONSE,
+    MERKLE_DIFF_REQUEST,
+    MERKLE_DIFF_RESPONSE,
+    MERKLE_RECORDS_TRANSFER,
+    MERKLE_RECORDS_ACK,
+    WIPE_DATA,
+    WIPE_DATA_ACK,
+    RUN_HINTED_HANDOFF,
+    RUN_HINTED_HANDOFF_RESPONSE,
+
     CLUSTER_UPDATE,
     CLUSTER_UPDATE_ACK
 }
@@ -41,7 +63,8 @@ enum class ErrorCode {
     INTERNAL_ERROR,
     INVALID_MODE,
     INVALID_TOPOLOGY,
-    INVALID_CONFIG
+    INVALID_CONFIG,
+    NODE_UNAVAILABLE
 }
 
 @Serializable
@@ -60,7 +83,17 @@ data class Version(
 data class VersionedEntry(
     val key: String,
     val value: String,
-    val version: Version? = null
+    val version: Version? = null,
+    val operationId: String? = null
+)
+
+@Serializable
+data class HintRecord(
+    val key: String,
+    val value: String,
+    val version: Version,
+    val operationId: String,
+    val intendedHomeNodeId: String
 )
 
 @Serializable
@@ -82,7 +115,23 @@ data class ClusterConfig(
     val mode: ClusterMode = ClusterMode.SINGLE,
     val topology: Topology = Topology.MESH,
     val starCenterId: String? = null,
-    val leaderNodeIds: List<String> = emptyList()
+    val leaderNodeIds: List<String> = emptyList(),
+    val homeReplicaIds: List<String> = emptyList(),
+    val spareNodeIds: List<String> = emptyList(),
+    val writeQuorum: Int = 3,
+    val readQuorum: Int = 3,
+    val writeQuorumMode: WriteQuorumMode = WriteQuorumMode.STRICT
+)
+
+@Serializable
+data class LeaderlessPayload(
+    val intendedHomeNodeId: String? = null,
+    val hints: List<HintRecord>? = null,
+    val merkleRoot: String? = null,
+    val bucketHashes: List<String>? = null,
+    val diffBuckets: List<Int>? = null,
+    val records: List<VersionedEntry>? = null,
+    val stats: Map<String, Long>? = null
 )
 
 @Serializable
@@ -108,7 +157,8 @@ data class Message(
     val versionedData: List<VersionedEntry>? = null,
     val version: Version? = null,
 
-    val clusterConfig: ClusterConfig? = null
+    val clusterConfig: ClusterConfig? = null,
+    val leaderless: LeaderlessPayload? = null
 )
 
 val JsonConfig = Json {

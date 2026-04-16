@@ -3,6 +3,7 @@ package com.yasashny.slreplication.cli
 import com.yasashny.slreplication.common.model.ClusterMode
 import com.yasashny.slreplication.common.model.ReplicationMode
 import com.yasashny.slreplication.common.model.Topology
+import com.yasashny.slreplication.common.model.WriteQuorumMode
 import org.slf4j.LoggerFactory
 import java.util.Scanner
 
@@ -37,7 +38,6 @@ fun main() {
                     return
                 }
 
-                // ===== Cluster management =====
 
                 "addnode" -> {
                     if (cmdArgs.size < 3) {
@@ -71,6 +71,8 @@ fun main() {
                         val config = manager.getConfig()
                         nodes.sortedBy { it.nodeId }.forEach { node ->
                             val role = when {
+                                config.mode == ClusterMode.LEADERLESS && node.nodeId in config.homeReplicaIds -> " (HOME)"
+                                config.mode == ClusterMode.LEADERLESS && node.nodeId in config.spareNodeIds -> " (SPARE)"
                                 config.mode == ClusterMode.MULTI && node.nodeId in config.leaderNodeIds -> " (LEADER)"
                                 config.mode == ClusterMode.MULTI -> " (FOLLOWER)"
                                 node.nodeId == config.leaderId -> " (LEADER)"
@@ -93,12 +95,13 @@ fun main() {
 
                 "setmode" -> {
                     if (cmdArgs.isEmpty()) {
-                        println("Usage: setMode single|multi")
+                        println("Usage: setMode single|multi|leaderless")
                     } else {
                         val m = when (cmdArgs[0].lowercase()) {
                             "single" -> ClusterMode.SINGLE
                             "multi" -> ClusterMode.MULTI
-                            else -> { println("Unknown mode: ${cmdArgs[0]}. Use single or multi"); null }
+                            "leaderless" -> ClusterMode.LEADERLESS
+                            else -> { println("Unknown mode: ${cmdArgs[0]}. Use single, multi, or leaderless"); null }
                         }
                         if (m != null) {
                             val result = manager.setMode(m)
@@ -144,7 +147,6 @@ fun main() {
                     }
                 }
 
-                // ===== Single-leader replication settings =====
 
                 "setreplication" -> {
                     if (cmdArgs.isEmpty()) {
@@ -204,31 +206,39 @@ fun main() {
                     }
                 }
 
-                // ===== Status =====
 
                 "status" -> {
                     val config = manager.getConfig()
                     println("Cluster status:")
                     println("  Mode: ${config.mode}")
                     println("  Nodes: ${config.nodes.size}")
-                    if (config.mode == ClusterMode.SINGLE) {
-                        println("  Leader: ${config.leaderId ?: "not set"}")
-                        println("  Replication mode: ${config.replicationMode}")
-                        println("  Replication factor: ${config.replicationFactor}")
-                        if (config.replicationMode == ReplicationMode.SEMI_SYNC) {
-                            println("  Semi-sync ACKs (K): ${config.semiSyncAcks}")
+                    when (config.mode) {
+                        ClusterMode.SINGLE -> {
+                            println("  Leader: ${config.leaderId ?: "not set"}")
+                            println("  Replication mode: ${config.replicationMode}")
+                            println("  Replication factor: ${config.replicationFactor}")
+                            if (config.replicationMode == ReplicationMode.SEMI_SYNC) {
+                                println("  Semi-sync ACKs (K): ${config.semiSyncAcks}")
+                            }
                         }
-                    } else {
-                        println("  Topology: ${config.topology}")
-                        println("  Leaders: ${config.leaderNodeIds.joinToString(", ").ifEmpty { "not set" }}")
-                        if (config.topology == Topology.STAR) {
-                            println("  Star center: ${config.starCenterId ?: "not set"}")
+                        ClusterMode.MULTI -> {
+                            println("  Topology: ${config.topology}")
+                            println("  Leaders: ${config.leaderNodeIds.joinToString(", ").ifEmpty { "not set" }}")
+                            if (config.topology == Topology.STAR) {
+                                println("  Star center: ${config.starCenterId ?: "not set"}")
+                            }
+                        }
+                        ClusterMode.LEADERLESS -> {
+                            println("  Home replicas: ${config.homeReplicaIds.joinToString(", ").ifEmpty { "not set" }}")
+                            println("  Spare nodes: ${config.spareNodeIds.joinToString(", ").ifEmpty { "not set" }}")
+                            println("  Write quorum (W): ${config.writeQuorum}")
+                            println("  Read quorum (R): ${config.readQuorum}")
+                            println("  Write quorum mode: ${config.writeQuorumMode}")
                         }
                     }
                     println("  Replication delay: ${config.replicationDelayMinMs}-${config.replicationDelayMaxMs} ms")
                 }
 
-                // ===== User commands =====
 
                 "put" -> {
                     val parsed = parseUserCommand(cmdArgs)
@@ -299,7 +309,6 @@ fun main() {
                     result.onFailure { println("Error: ${it.message}") }
                 }
 
-                // ===== Debug commands =====
 
                 "getall" -> {
                     if (cmdArgs.isEmpty()) {
@@ -355,7 +364,112 @@ fun main() {
                     }
                 }
 
-                // ===== Benchmark =====
+
+                "sethomereplicas" -> {
+                    if (cmdArgs.size < 5) println("Usage: setHomeReplicas <id1> <id2> <id3> <id4> <id5>")
+                    else {
+                        val result = manager.setHomeReplicas(cmdArgs.take(5))
+                        result.onSuccess { println(it) }
+                        result.onFailure { println("Error: ${it.message}") }
+                    }
+                }
+
+                "setsparenodes" -> {
+                    if (cmdArgs.size < 2) println("Usage: setSpareNodes <id1> <id2>")
+                    else {
+                        val result = manager.setSpareNodes(cmdArgs.take(2))
+                        result.onSuccess { println(it) }
+                        result.onFailure { println("Error: ${it.message}") }
+                    }
+                }
+
+                "setquorum" -> {
+                    if (cmdArgs.size < 2) println("Usage: setQuorum <W> <R>")
+                    else {
+                        val w = cmdArgs[0].toIntOrNull()
+                        val r = cmdArgs[1].toIntOrNull()
+                        if (w == null || r == null) println("Invalid quorum values")
+                        else {
+                            val result = manager.setQuorum(w, r)
+                            result.onSuccess { println(it) }
+                            result.onFailure { println("Error: ${it.message}") }
+                        }
+                    }
+                }
+
+                "setwritequorummode" -> {
+                    if (cmdArgs.isEmpty()) println("Usage: setWriteQuorumMode strict|sloppy")
+                    else {
+                        val wqm = when (cmdArgs[0].lowercase()) {
+                            "strict" -> WriteQuorumMode.STRICT
+                            "sloppy" -> WriteQuorumMode.SLOPPY
+                            else -> { println("Unknown mode: ${cmdArgs[0]}. Use strict or sloppy"); null }
+                        }
+                        if (wqm != null) {
+                            val result = manager.setWriteQuorumMode(wqm)
+                            result.onSuccess { println(it) }
+                            result.onFailure { println("Error: ${it.message}") }
+                        }
+                    }
+                }
+
+                "dumphints" -> {
+                    val parsed = parseUserCommand(cmdArgs)
+                    val result = manager.dumpHints(parsed.target)
+                    result.onSuccess { response ->
+                        if (response.status == "OK") {
+                            val hints = response.leaderless?.hints
+                            if (hints.isNullOrEmpty()) println("(no hints)")
+                            else {
+                                println("Hints (${hints.size} entries):")
+                                hints.forEach { h ->
+                                    println("  ${h.key}=${h.value} -> ${h.intendedHomeNodeId} [v=(${h.version.lamport},${h.version.nodeId})] opId=${h.operationId}")
+                                }
+                            }
+                        } else println("Error: ${response.errorCode} - ${response.errorMessage}")
+                    }
+                    result.onFailure { println("Error: ${it.message}") }
+                }
+
+                "runhintedhandoff" -> {
+                    val parsed = parseUserCommand(cmdArgs)
+                    val results = manager.runHintedHandoff(parsed.target)
+                    for ((nid, res) in results) {
+                        res.onSuccess { response ->
+                            val stats = response.leaderless?.stats
+                            println("  $nid: delivered=${stats?.get("hintsDelivered") ?: 0}, failed=${stats?.get("hintsFailed") ?: 0}")
+                        }
+                        res.onFailure { println("  $nid: Error: ${it.message}") }
+                    }
+                }
+
+                "showmerkleroot" -> {
+                    if (cmdArgs.isEmpty()) println("Usage: showMerkleRoot <nodeId>")
+                    else {
+                        val result = manager.showMerkleRoot(cmdArgs[0])
+                        result.onSuccess { response ->
+                            println("Merkle root for ${cmdArgs[0]}: ${response.leaderless?.merkleRoot ?: "(empty)"}")
+                        }
+                        result.onFailure { println("Error: ${it.message}") }
+                    }
+                }
+
+                "wipenodedata" -> {
+                    if (cmdArgs.isEmpty()) println("Usage: wipeNodeData <nodeId>")
+                    else {
+                        val result = manager.wipeNodeData(cmdArgs[0])
+                        result.onSuccess { println("Node ${cmdArgs[0]} data wiped") }
+                        result.onFailure { println("Error: ${it.message}") }
+                    }
+                }
+
+                "runantientropycluster" -> {
+                    println("Running cluster-wide anti-entropy...")
+                    val result = manager.runAntiEntropyCluster()
+                    result.onSuccess { println(it) }
+                    result.onFailure { println("Error: ${it.message}") }
+                }
+
 
                 "benchmark" -> runBenchmark(manager, cmdArgs)
 
@@ -418,7 +532,7 @@ private fun printHelp() {
         removeNode <nodeId>                 - Remove a node from the cluster
         listNodes                           - List all nodes
         setLeader <nodeId>                  - Set the leader node (single mode)
-        setMode single|multi                - Set cluster mode
+        setMode single|multi|leaderless     - Set cluster mode
         setTopology mesh|ring|star          - Set replication topology (multi mode)
         setStarCenter <nodeId>              - Set star center node (star topology)
         setLeaders <id1> [id2] ...          - Set leader nodes (multi mode)
@@ -427,6 +541,17 @@ private fun printHelp() {
         setSemiSyncAcks <int>               - Set K for semi-sync mode
         setReplicationDelayMs <min> <max>   - Set replication delay range
         status                              - Show cluster status
+
+        === Leaderless Mode ===
+        setHomeReplicas <id1>..<id5>        - Set 5 home replica nodes
+        setSpareNodes <id1> <id2>           - Set 2 spare nodes
+        setQuorum <W> <R>                   - Set write/read quorum (W+R>5)
+        setWriteQuorumMode strict|sloppy    - Set write quorum mode
+        dumpHints [--target <nodeId>]       - Show hints on a node
+        runHintedHandoff [--target <nodeId>]- Deliver hints to home replicas
+        showMerkleRoot <nodeId>             - Show Merkle tree root hash
+        wipeNodeData <nodeId>               - Clear node's data (simulate crash)
+        runAntiEntropyCluster               - Run cluster-wide anti-entropy
 
         === User Commands ===
         put <key> <value> [--target <nodeId>]  - Put a key-value pair

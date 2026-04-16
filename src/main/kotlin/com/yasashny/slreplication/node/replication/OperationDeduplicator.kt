@@ -56,5 +56,9 @@ class OperationDeduplicator(
         scope.cancel()
     }
 
+    fun reset() {
+        seenOperations.clear()
+    }
+
     fun size(): Int = seenOperations.size
 }

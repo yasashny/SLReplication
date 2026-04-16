@@ -111,17 +111,14 @@ class TcpClient(
         }
     }
 
-    @Synchronized
     fun close() {
         connected.set(false)
+        scope.cancel()
         pendingResponses.values.forEach { it.cancel() }
         pendingResponses.clear()
         try {
-            reader?.close()
-            writer?.close()
             socket?.close()
         } catch (_: Exception) {}
-        scope.cancel()
     }
 }
 

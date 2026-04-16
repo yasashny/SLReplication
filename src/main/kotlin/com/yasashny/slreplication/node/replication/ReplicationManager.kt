@@ -21,7 +21,6 @@ data class PendingOperation(
     val value: String,
     val targetNodeId: String,
     val retryCount: Int = 0,
-    val createdAt: Long = System.currentTimeMillis(),
     val originNodeId: String? = null,
     val version: Version? = null,
     val sourceNodeId: String? = null
@@ -34,6 +33,7 @@ class ReplicationManager(
 ) {
     private val logger = LoggerFactory.getLogger(ReplicationManager::class.java)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val router = TopologyRouter(nodeId)
 
     private val pendingQueues = ConcurrentHashMap<String, ConcurrentLinkedQueue<PendingOperation>>()
     private val ackCounters = ConcurrentHashMap<String, AtomicInteger>()
@@ -47,50 +47,38 @@ class ReplicationManager(
         startRetryWorker()
     }
 
-    // ========== Single-leader replication ==========
 
     suspend fun replicatePut(key: String, value: String): ReplicationResult {
         val config = getConfig()
         val operationId = UUID.randomUUID().toString()
 
-        logger.debug(
-            "Replicating PUT key={}, opId={}, mode={}, RF={}",
-            key, operationId, config.replicationMode, config.replicationFactor
-        )
-
         val followers = config.nodes.filter { it.nodeId != nodeId }
-        if (followers.isEmpty()) {
-            logger.debug("No followers to replicate to")
-            return ReplicationResult.Success
-        }
+        if (followers.isEmpty()) return ReplicationResult.Success
 
         val delay = computeDelay(config)
-
         ackCounters[operationId] = AtomicInteger(0)
 
         followers.forEach { follower ->
             scope.launch {
                 if (delay > 0) delay(delay)
-                sendSingleReplication(operationId, key, value, follower.nodeId)
+                sendReplication(operationId, key, value, nodeId, nodeId, null, follower.nodeId)
             }
         }
 
         return when (config.replicationMode) {
             ReplicationMode.ASYNC -> ReplicationResult.Success
-
             ReplicationMode.SYNC -> {
                 val requiredAcks = config.replicationFactor - 1
-                val effectiveTimeout = baseSyncTimeoutMs + config.replicationDelayMaxMs
-                waitForAcks(operationId, requiredAcks, effectiveTimeout, followers.size)
+                val timeout = baseSyncTimeoutMs + config.replicationDelayMaxMs
+                waitForAcks(operationId, requiredAcks, timeout, followers.size)
             }
-
             ReplicationMode.SEMI_SYNC -> {
                 val requiredAcks = config.semiSyncAcks
-                val effectiveTimeout = baseSemiSyncTimeoutMs + config.replicationDelayMaxMs
-                val result = waitForAcks(operationId, requiredAcks, effectiveTimeout, followers.size)
+                val timeout = baseSemiSyncTimeoutMs + config.replicationDelayMaxMs
+                val result = waitForAcks(operationId, requiredAcks, timeout, followers.size)
                 if (result is ReplicationResult.Success) {
-                    val remainingAcks = config.replicationFactor - 1 - requiredAcks
-                    if (remainingAcks > 0) {
+                    val remaining = config.replicationFactor - 1 - requiredAcks
+                    if (remaining > 0) {
                         scope.launch {
                             continueReplication(operationId, config.replicationFactor - 1, followers.size)
                         }
@@ -101,11 +89,10 @@ class ReplicationManager(
         }
     }
 
-    // ========== Multi-leader replication ==========
 
     fun replicateMulti(operationId: String, key: String, value: String, version: Version, originNodeId: String) {
         val config = getConfig()
-        val targets = getInitialTargets(config)
+        val targets = router.getInitialTargets(config)
         val delay = computeDelay(config)
 
         logger.debug("Multi replicating opId={}, topology={}, targets={}", operationId, config.topology, targets)
@@ -113,15 +100,14 @@ class ReplicationManager(
         targets.forEach { targetNodeId ->
             scope.launch {
                 if (delay > 0) delay(delay)
-                sendMultiReplication(operationId, key, value, version, originNodeId, nodeId, targetNodeId)
+                sendReplication(operationId, key, value, originNodeId, nodeId, version, targetNodeId)
             }
         }
     }
 
     fun forwardMulti(operationId: String, key: String, value: String, version: Version, originNodeId: String, sourceNodeId: String) {
         val config = getConfig()
-        val targets = getForwardTargets(config, originNodeId, sourceNodeId)
-
+        val targets = router.getForwardTargets(config, originNodeId, sourceNodeId)
         if (targets.isEmpty()) return
 
         val delay = computeDelay(config)
@@ -131,73 +117,16 @@ class ReplicationManager(
         targets.forEach { targetNodeId ->
             scope.launch {
                 if (delay > 0) delay(delay)
-                sendMultiReplication(operationId, key, value, version, originNodeId, nodeId, targetNodeId)
+                sendReplication(operationId, key, value, originNodeId, nodeId, version, targetNodeId)
             }
         }
     }
 
-    // ========== Topology target computation ==========
 
-    private fun getInitialTargets(config: ClusterConfig): List<String> {
-        val allOthers = config.nodes.map { it.nodeId }.filter { it != nodeId }
-        return when (config.topology) {
-            Topology.MESH -> allOthers
-            Topology.RING -> {
-                val next = getNextInRing(config)
-                if (next != null) listOf(next) else emptyList()
-            }
-            Topology.STAR -> {
-                if (nodeId == config.starCenterId) {
-                    allOthers
-                } else {
-                    val center = config.starCenterId
-                    if (center != null && center != nodeId) listOf(center) else emptyList()
-                }
-            }
-        }
-    }
-
-    private fun getForwardTargets(config: ClusterConfig, originNodeId: String, sourceNodeId: String): List<String> {
-        return when (config.topology) {
-            Topology.MESH -> emptyList()
-            Topology.RING -> {
-                val next = getNextInRing(config)
-                if (next != null && next != originNodeId) listOf(next) else emptyList()
-            }
-            Topology.STAR -> {
-                if (nodeId == config.starCenterId) {
-                    config.nodes.map { it.nodeId }
-                        .filter { it != nodeId && it != sourceNodeId && it != originNodeId }
-                } else {
-                    emptyList()
-                }
-            }
-        }
-    }
-
-    private fun getNextInRing(config: ClusterConfig): String? {
-        val sorted = config.nodes.map { it.nodeId }.sorted()
-        val idx = sorted.indexOf(nodeId)
-        if (idx == -1) return null
-        return sorted[(idx + 1) % sorted.size]
-    }
-
-    // ========== Send helpers ==========
-
-    private fun sendSingleReplication(operationId: String, key: String, value: String, targetNodeId: String) {
-        val message = Message(
-            type = MessageType.REPL_PUT,
-            operationId = operationId,
-            originNodeId = nodeId,
-            key = key,
-            value = value
-        )
-        sendOrQueue(message, targetNodeId, PendingOperation(operationId, key, value, targetNodeId))
-    }
-
-    private fun sendMultiReplication(
+    private fun sendReplication(
         operationId: String, key: String, value: String,
-        version: Version, originNodeId: String, sourceNodeId: String, targetNodeId: String
+        originNodeId: String, sourceNodeId: String,
+        version: Version?, targetNodeId: String
     ) {
         val message = Message(
             type = MessageType.REPL_PUT,
@@ -208,32 +137,29 @@ class ReplicationManager(
             value = value,
             version = version
         )
-        sendOrQueue(message, targetNodeId, PendingOperation(
+        val pending = PendingOperation(
             operationId = operationId, key = key, value = value, targetNodeId = targetNodeId,
             originNodeId = originNodeId, version = version, sourceNodeId = sourceNodeId
-        ))
+        )
+        sendOrQueue(message, targetNodeId, pending)
     }
 
     private fun sendOrQueue(message: Message, targetNodeId: String, pendingOp: PendingOperation) {
         val client = getNodeConnection(targetNodeId)
-        if (client == null || !client.send(message)) {
-            logger.debug("Failed to send replication to $targetNodeId, queuing for retry")
-            val queue = pendingQueues.getOrPut(targetNodeId) { ConcurrentLinkedQueue() }
-            queue.add(pendingOp)
-        } else {
+        if (client != null && client.send(message)) {
             logger.debug("Sent replication to $targetNodeId: opId=${message.operationId}")
+        } else {
+            logger.debug("Failed to send replication to $targetNodeId, queuing for retry")
+            pendingQueues.getOrPut(targetNodeId) { ConcurrentLinkedQueue() }.add(pendingOp)
         }
     }
 
-    // ========== ACK handling ==========
 
     fun handleAck(operationId: String, fromNodeId: String) {
         val counter = ackCounters[operationId]
         if (counter != null) {
             val newCount = counter.incrementAndGet()
             logger.debug("ACK opId=$operationId from $fromNodeId, total=$newCount")
-        } else {
-            logger.debug("ACK for unknown/expired opId=$operationId from $fromNodeId")
         }
     }
 
@@ -288,58 +214,51 @@ class ReplicationManager(
         }
     }
 
-    // ========== Retry worker ==========
 
     private fun startRetryWorker() {
         scope.launch {
             while (isActive) {
                 delay(retryDelayMs)
+                retryPendingOperations()
+            }
+        }
+    }
 
-                for ((targetNodeId, queue) in pendingQueues) {
-                    val client = getNodeConnection(targetNodeId)
-                    if (client == null || !client.isConnected()) continue
+    private fun retryPendingOperations() {
+        for ((targetNodeId, queue) in pendingQueues) {
+            val client = getNodeConnection(targetNodeId)
+            if (client == null || !client.isConnected()) continue
 
-                    val toRetry = mutableListOf<PendingOperation>()
-                    while (true) {
-                        val op = queue.poll() ?: break
-                        toRetry.add(op)
-                    }
-
-                    for (op in toRetry) {
-                        if (op.retryCount >= maxRetries) {
-                            logger.warn("Max retries for opId=${op.operationId} to ${op.targetNodeId}")
-                            continue
-                        }
-
-                        val message = if (op.version != null) {
-                            Message(
-                                type = MessageType.REPL_PUT,
-                                operationId = op.operationId,
-                                originNodeId = op.originNodeId ?: nodeId,
-                                sourceNodeId = op.sourceNodeId ?: nodeId,
-                                key = op.key, value = op.value, version = op.version
-                            )
-                        } else {
-                            Message(
-                                type = MessageType.REPL_PUT,
-                                operationId = op.operationId,
-                                originNodeId = nodeId,
-                                key = op.key, value = op.value
-                            )
-                        }
-
-                        if (!client.send(message)) {
-                            queue.add(op.copy(retryCount = op.retryCount + 1))
-                        } else {
-                            logger.debug("Retried replication to ${op.targetNodeId}: opId=${op.operationId}")
-                        }
-                    }
+            val batch = drainQueue(queue)
+            for (op in batch) {
+                if (op.retryCount >= maxRetries) {
+                    logger.warn("Max retries for opId=${op.operationId} to ${op.targetNodeId}")
+                    continue
+                }
+                val message = Message(
+                    type = MessageType.REPL_PUT,
+                    operationId = op.operationId,
+                    originNodeId = op.originNodeId ?: nodeId,
+                    sourceNodeId = op.sourceNodeId ?: nodeId,
+                    key = op.key, value = op.value, version = op.version
+                )
+                if (!client.send(message)) {
+                    queue.add(op.copy(retryCount = op.retryCount + 1))
+                } else {
+                    logger.debug("Retried replication to ${op.targetNodeId}: opId=${op.operationId}")
                 }
             }
         }
     }
 
-    // ========== Utility ==========
+    private fun drainQueue(queue: ConcurrentLinkedQueue<PendingOperation>): List<PendingOperation> {
+        val result = mutableListOf<PendingOperation>()
+        while (true) {
+            result.add(queue.poll() ?: break)
+        }
+        return result
+    }
+
 
     private fun computeDelay(config: ClusterConfig): Long {
         return if (config.replicationDelayMinMs > 0 || config.replicationDelayMaxMs > 0) {

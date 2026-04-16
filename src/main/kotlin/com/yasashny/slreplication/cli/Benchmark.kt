@@ -1,6 +1,7 @@
 package com.yasashny.slreplication.cli
 
 import com.yasashny.slreplication.common.model.*
+import com.yasashny.slreplication.common.model.LeaderlessPayload
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import java.io.File
@@ -50,6 +51,7 @@ fun runBenchmark(manager: ClusterManager, args: List<String>) {
     var outputFile: String? = null
     var runAll = false
     var runAllMulti = false
+    var runAllLeaderless = false
     var keySpace = 10000
 
     var i = 0
@@ -62,6 +64,7 @@ fun runBenchmark(manager: ClusterManager, args: List<String>) {
             "--output" -> outputFile = args.getOrNull(++i)
             "--run-all" -> runAll = true
             "--run-all-multi" -> runAllMulti = true
+            "--run-all-leaderless" -> runAllLeaderless = true
             "--key-space" -> keySpace = args.getOrNull(++i)?.toIntOrNull() ?: keySpace
             "--help" -> {
                 println("""
@@ -73,6 +76,7 @@ fun runBenchmark(manager: ClusterManager, args: List<String>) {
                       --output <file>     Output CSV file
                       --run-all           Run all single-leader scenarios
                       --run-all-multi     Run all multi-leader scenarios (Parts A, B, C)
+                      --run-all-leaderless Run all leaderless scenarios (Parts A, B, C)
                       --key-space <n>     Unique keys (default: 10000)
                       --help              Show this help
                 """.trimIndent())
@@ -88,7 +92,9 @@ fun runBenchmark(manager: ClusterManager, args: List<String>) {
         return
     }
 
-    if (runAllMulti) {
+    if (runAllLeaderless) {
+        runAllLeaderlessBenchmarks(manager, threads, opsPerThread, warmupOps, outputFile ?: "benchmarks/results-leaderless.csv")
+    } else if (runAllMulti) {
         runAllMultiBenchmarks(manager, threads, opsPerThread, warmupOps, outputFile ?: "benchmarks/results-multi.csv")
     } else if (runAll) {
         if (config.leaderId == null && config.mode == ClusterMode.SINGLE) {
@@ -103,14 +109,12 @@ fun runBenchmark(manager: ClusterManager, args: List<String>) {
     }
 }
 
-// ========== Single-leader benchmark scenarios (HW2) ==========
 
 private fun runAllSingleBenchmarks(manager: ClusterManager, threads: Int, opsPerThread: Int, warmupOps: Int, outputFile: String) {
     val results = mutableListOf<BenchmarkResult>()
     println("Running all single-leader benchmark scenarios...")
     println()
 
-    // Part A: sync/async x RF(1,2,3) x putRatio(0.8, 0.2) = 12 runs
     for (mode in listOf(ReplicationMode.SYNC, ReplicationMode.ASYNC)) {
         for (rf in listOf(1, 2, 3)) {
             for (putRatio in listOf(0.8, 0.2)) {
@@ -126,7 +130,6 @@ private fun runAllSingleBenchmarks(manager: ClusterManager, threads: Int, opsPer
         }
     }
 
-    // Part B: async/semi-sync(K=1)/sync x RF=3 x putRatio(0.8, 0.2) = 6 runs
     for ((mode, rf, k) in listOf(
         Triple(ReplicationMode.ASYNC, 3, 1),
         Triple(ReplicationMode.SEMI_SYNC, 3, 1),
@@ -149,7 +152,6 @@ private fun runAllSingleBenchmarks(manager: ClusterManager, threads: Int, opsPer
     println("Results saved to $outputFile")
 }
 
-// ========== Multi-leader benchmark scenarios (HW3) ==========
 
 private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerThread: Int, warmupOps: Int, outputFile: String) {
     val results = mutableListOf<BenchmarkResult>()
@@ -165,8 +167,6 @@ private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerT
     println("Leaders: ${leaders.joinToString(", ")}")
     println()
 
-    // --- Part A: Topology comparison (6 runs) ---
-    // mode=multi, topology=mesh|ring|star, putRatio=0.8|0.2, threads=16, totalOps>=200000
     val multiOpsPerThread = maxOf(opsPerThread, 200000 / threads)
 
     manager.setMode(ClusterMode.MULTI)
@@ -186,8 +186,6 @@ private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerT
         }
     }
 
-    // --- Part B: Conflict comparison (2 runs) ---
-    // mode=multi, topology=mesh, putRatio=1.0, threads=32, keySpace=5 and 10000
     manager.setTopology(Topology.MESH)
 
     for (ks in listOf(5, 10000)) {
@@ -199,8 +197,6 @@ private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerT
         Thread.sleep(1000)
     }
 
-    // --- Part C: Single vs Multi comparison (4 runs) ---
-    // 1. single, async, RF=1
     manager.setMode(ClusterMode.SINGLE)
     manager.setLeader(allNodeIds.first())
     manager.setReplicationMode(ReplicationMode.ASYNC)
@@ -213,7 +209,6 @@ private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerT
     println()
     Thread.sleep(1000)
 
-    // 2. single, sync, RF=3
     manager.setReplicationMode(ReplicationMode.SYNC)
     manager.setReplicationFactor(3)
 
@@ -224,7 +219,6 @@ private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerT
     println()
     Thread.sleep(1000)
 
-    // 3. multi, mesh
     manager.setMode(ClusterMode.MULTI)
     manager.setLeaders(leaders)
     manager.setTopology(Topology.MESH)
@@ -236,7 +230,6 @@ private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerT
     println()
     Thread.sleep(1000)
 
-    // 4. multi, star
     manager.setTopology(Topology.STAR)
     manager.setStarCenter(allNodeIds.first())
 
@@ -250,7 +243,123 @@ private fun runAllMultiBenchmarks(manager: ClusterManager, threads: Int, opsPerT
     println("Results saved to $outputFile")
 }
 
-// ========== Core benchmark runner ==========
+
+private fun runAllLeaderlessBenchmarks(manager: ClusterManager, threads: Int, opsPerThread: Int, warmupOps: Int, outputFile: String) {
+    val results = mutableListOf<BenchmarkResult>()
+    val config = manager.getConfig()
+    val allNodeIds = config.nodes.map { it.nodeId }.sorted()
+
+    if (allNodeIds.size < 7) {
+        println("Warning: Leaderless benchmarks expect 7 nodes, have ${allNodeIds.size}")
+    }
+
+    val homeReplicas = allNodeIds.take(5)
+    val spareNodes = allNodeIds.drop(5).take(2)
+
+    println("Running leaderless benchmark scenarios...")
+    println("Home replicas: ${homeReplicas.joinToString(", ")}")
+    println("Spare nodes: ${spareNodes.joinToString(", ")}")
+    println()
+
+    manager.setMode(ClusterMode.LEADERLESS)
+    manager.setHomeReplicas(homeReplicas)
+    if (spareNodes.size == 2) manager.setSpareNodes(spareNodes)
+
+    manager.setWriteQuorumMode(WriteQuorumMode.STRICT)
+
+    for ((w, r) in listOf(3 to 3, 4 to 2, 5 to 1)) {
+        manager.setQuorum(w, r)
+        for (putRatio in listOf(0.8, 0.2)) {
+            println("=== Part A: LEADERLESS strict W=$w R=$r putRatio=$putRatio ===")
+            val result = runSingleBenchmark(manager, threads, opsPerThread, putRatio, warmupOps, 10000)
+            results.add(result.copy(
+                replicationMode = "STRICT_W${w}_R${r}",
+                mode = "LEADERLESS"
+            ))
+            printResultShort(result)
+
+            val stats = manager.getLeaderlessStats()
+            println("  Leaderless stats: $stats")
+            println()
+            Thread.sleep(1000)
+        }
+    }
+
+    manager.setQuorum(3, 3)
+
+    val failedHome = homeReplicas.last()
+    println("=== Part B: Simulating failure of $failedHome ===")
+    manager.removeNode(failedHome)
+    Thread.sleep(1000)
+
+    for (wqMode in listOf(WriteQuorumMode.STRICT, WriteQuorumMode.SLOPPY)) {
+        manager.setWriteQuorumMode(wqMode)
+        println("=== Part B: LEADERLESS ${wqMode.name} W=3 R=3 (one home down) putRatio=0.8 ===")
+        val result = runSingleBenchmark(manager, threads, opsPerThread, 0.8, warmupOps, 10000)
+        results.add(result.copy(
+            replicationMode = "${wqMode.name}_DEGRADED",
+            mode = "LEADERLESS"
+        ))
+        printResultShort(result)
+        val stats = manager.getLeaderlessStats()
+        println("  Leaderless stats: $stats")
+        println()
+        Thread.sleep(1000)
+    }
+
+    val failedNodeInfo = config.nodes.find { it.nodeId == failedHome }
+    if (failedNodeInfo != null) {
+        manager.addNode(failedNodeInfo.nodeId, failedNodeInfo.host, failedNodeInfo.port)
+        manager.setHomeReplicas(homeReplicas)
+        if (spareNodes.size == 2) manager.setSpareNodes(spareNodes)
+    }
+    Thread.sleep(1000)
+
+    println("=== Part C: Recovery benchmark ===")
+    manager.setWriteQuorumMode(WriteQuorumMode.STRICT)
+    manager.setQuorum(3, 3)
+
+    println("  Writing 100 keys...")
+    for (i in 1..100) {
+        manager.put("recovery_key_$i", "value_$i")
+    }
+    Thread.sleep(2000)
+
+    val wipeTarget = homeReplicas.first()
+    println("  Wiping $wipeTarget...")
+    manager.wipeNodeData(wipeTarget)
+    Thread.sleep(500)
+
+    val recoveryStart = System.currentTimeMillis()
+    val aeResult = manager.runAntiEntropyCluster()
+    val recoveryTimeMs = System.currentTimeMillis() - recoveryStart
+
+    println("  Recovery time: ${recoveryTimeMs}ms")
+    aeResult.onSuccess { println("  $it") }
+    aeResult.onFailure { println("  Error: ${it.message}") }
+
+    val recoveryStats = manager.getLeaderlessStats()
+    println("  Recovery stats: $recoveryStats")
+    println()
+
+    results.add(BenchmarkResult(
+        replicationMode = "RECOVERY",
+        rf = 5, k = 0, threads = 1, putRatio = 0.0,
+        totalOps = 100, successfulOps = 100, failedOps = 0,
+        durationMs = recoveryTimeMs,
+        throughputOpsSec = 0.0,
+        avgMs = recoveryTimeMs.toDouble(), p50Ms = 0.0, p75Ms = 0.0, p95Ms = 0.0, p99Ms = 0.0,
+        putAvgMs = 0.0, putP50Ms = 0.0, putP95Ms = 0.0,
+        getAvgMs = 0.0, getP50Ms = 0.0, getP95Ms = 0.0,
+        mode = "LEADERLESS",
+        convergenceTimeMs = recoveryTimeMs,
+        keySpace = 100
+    ))
+
+    saveResults(results, outputFile)
+    println("Results saved to $outputFile")
+}
+
 
 private fun runSingleBenchmark(
     manager: ClusterManager,
@@ -265,10 +374,9 @@ private fun runSingleBenchmark(
     val completedOps = AtomicLong(0)
     val totalOps = threads * opsPerThread
 
-    // Warmup
     if (warmupOps > 0) {
         print("Warming up... ")
-        val warmupTarget = if (config.mode == ClusterMode.MULTI) null else null // use default target
+        val warmupTarget: String? = null
         repeat(warmupOps) { manager.put("warmup_$it", "warmup_value", warmupTarget) }
         println("done")
     }
@@ -307,7 +415,6 @@ private fun runSingleBenchmark(
     val durationMs = System.currentTimeMillis() - startTime
     println("done (${durationMs}ms)")
 
-    // Measure convergence time for multi mode
     val convergenceTimeMs = if (config.mode == ClusterMode.MULTI) {
         measureConvergenceTime(manager)
     } else 0L
@@ -353,12 +460,11 @@ private fun measureConvergenceTime(manager: ClusterManager): Long {
     val testValue = "conv_${Random.nextInt(1000000)}"
     val config = manager.getConfig()
 
-    // Write to one leader
     val leader = config.leaderNodeIds.firstOrNull() ?: return 0
     manager.put(testKey, testValue, leader)
 
     val start = System.currentTimeMillis()
-    val deadline = start + 30000 // 30s max wait
+    val deadline = start + 30000
 
     while (System.currentTimeMillis() < deadline) {
         val results = manager.getAll(testKey)
@@ -374,7 +480,6 @@ private fun measureConvergenceTime(manager: ClusterManager): Long {
     return System.currentTimeMillis() - start
 }
 
-// ========== Printing & saving ==========
 
 private fun printResult(result: BenchmarkResult) {
     println("""
