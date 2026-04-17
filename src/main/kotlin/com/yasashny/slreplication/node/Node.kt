@@ -32,7 +32,10 @@ class Node(
     private val replicationManager = ReplicationManager(
         nodeId = nodeId,
         getConfig = { config },
-        getNodeConnection = { targetNodeId -> getConnection(targetNodeId) }
+        getNodeConnection = { targetNodeId -> getConnection(targetNodeId) },
+        store = store,
+        lamportClock = lamportClock,
+        deduplicator = deduplicator
     )
 
     private val leaderlessCoordinator = LeaderlessCoordinator(
@@ -87,8 +90,12 @@ class Node(
             MessageType.CLIENT_DUMP -> handleDump(message, sender)
             MessageType.CLIENT_DUMP_HINTS -> handleDumpHints(message, sender)
             MessageType.CLUSTER_UPDATE -> handleClusterUpdate(message, sender)
-            MessageType.REPL_PUT -> handleReplicationPut(message)
-            MessageType.REPL_ACK -> handleReplicationAck(message)
+            MessageType.REPL_PUT -> replicationManager.handleIncoming(message)
+            MessageType.REPL_ACK -> {
+                val opId = message.operationId
+                val from = message.fromNodeId ?: message.originNodeId
+                if (opId != null && from != null) replicationManager.handleAck(opId, from)
+            }
 
             MessageType.REPL_WRITE -> leaderlessCoordinator.handleReplicationWrite(message, sender)
             MessageType.READ_QUERY -> leaderlessCoordinator.handleReadQuery(message, sender)
@@ -249,71 +256,6 @@ class Node(
                 "leader=${newConfig.leaderId}, leaders=${newConfig.leaderNodeIds}, topology=${newConfig.topology}")
         config = newConfig
         sender.send(Message(type = MessageType.CLUSTER_UPDATE_ACK, requestId = message.requestId, status = "OK"))
-    }
-
-
-    private fun handleReplicationPut(message: Message) {
-        val operationId = message.operationId
-        val key = message.key
-        val value = message.value
-        val originNodeId = message.originNodeId
-
-        if (operationId == null || key == null || value == null || originNodeId == null) {
-            logger.warn("Invalid replication message: missing required fields")
-            return
-        }
-
-        if (deduplicator.isDuplicate(operationId)) {
-            logger.debug("Duplicate operation ignored: $operationId")
-            sendAck(operationId, originNodeId)
-            return
-        }
-
-        if (config.mode == ClusterMode.MULTI) {
-            handleMultiReplicationPut(message, operationId, key, value, originNodeId)
-        } else {
-            store.put(key, value)
-            logger.debug("Applied replicated PUT: $key = $value (opId=$operationId)")
-            sendAck(operationId, originNodeId)
-        }
-    }
-
-    private fun handleMultiReplicationPut(
-        message: Message, operationId: String, key: String, value: String, originNodeId: String
-    ) {
-        val version = message.version
-        if (version == null) {
-            logger.warn("Multi REPL_PUT missing version: opId=$operationId")
-            return
-        }
-
-        lamportClock.merge(version.lamport)
-
-        val applied = store.putVersioned(key, value, version)
-        if (applied) {
-            logger.debug("Applied multi replicated PUT: $key=$value, v=(${version.lamport},${version.nodeId})")
-        } else {
-            logger.debug("Rejected older version for $key: v=(${version.lamport},${version.nodeId})")
-        }
-
-        sendAck(operationId, originNodeId)
-
-        val sourceNodeId = message.sourceNodeId ?: originNodeId
-        replicationManager.forwardMulti(operationId, key, value, version, originNodeId, sourceNodeId)
-    }
-
-    private fun handleReplicationAck(message: Message) {
-        val operationId = message.operationId ?: return
-        val fromNodeId = message.fromNodeId ?: message.originNodeId ?: return
-        replicationManager.handleAck(operationId, fromNodeId)
-    }
-
-    private fun sendAck(operationId: String, targetNodeId: String) {
-        val client = getConnection(targetNodeId) ?: return
-        val ack = Message(type = MessageType.REPL_ACK, operationId = operationId, fromNodeId = nodeId)
-        if (!client.send(ack)) {
-            logger.warn("Failed to send ACK for opId=$operationId to $targetNodeId")
-        }
     }
 
 

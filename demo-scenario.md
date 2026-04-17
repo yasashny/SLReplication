@@ -39,24 +39,29 @@ status
 Цель: показать strict write quorum, задержку, stale read, async read-repair.
 
 ```
-# Устанавливаем задержку репликации
-setReplicationDelayMs 500 1500
+# Ставим большую задержку, чтобы окно stale было достаточно длинным для наблюдения вручную
+setReplicationDelayMs 5000 10000
 
-# Записываем ключ
+# Записываем ключ.
+# PUT возвращает OK, как только координатор собрал W=3 ACK.
+# Оставшиеся 2 медленные home-реплики ещё "спят" в delay — значения у них пока нет.
 put x hello
-# OK — запись прошла через quorum (W=3)
 
-# Сразу читаем — часть реплик может быть stale
+сырое состояние каждой home-реплики смотрим через clusterDump,
+clusterDump
+# У 2 из 5 home-реплик ключа x нет — они ещё в задержке.
+
+# Клиентский GET через quorum — координатор собирает R=3 ответа,
+# выбирает запись с max version и возвращает "hello".
+# Заодно видит stale у 2 home-реплик и планирует async read-repair им.
 get x
-# Должно вернуть "hello" (координатор выбирает max version из R ответов)
 
-# Проверяем все узлы
-getAll x
-# Некоторые home-реплики могут показать (nil) из-за задержки
-
-# Ждём ~2с и проверяем снова — read-repair исправляет stale
-getAll x
-# Все home-реплики: x = hello
+# Сразу после GET — read-repair уже успел применить свежую версию
+# на stale-репликах (REPL_WRITE из read-repair идёт без инжектированной задержки).
+# Даже если исходные медленные REPL_WRITE всё ещё в полёте — они будут
+# отсеяны дедупликатором по operationId.
+clusterDump
+# Все 5 home-реплик: x = hello.
 
 # Убираем задержку
 setReplicationDelayMs 0 0
@@ -73,7 +78,8 @@ setReplicationDelayMs 0 0
 setWriteQuorumMode sloppy
 
 # "Ломаем" одну home-реплику (убиваем процесс H5 через Ctrl+C)
-removeNode H5
+
+setQuorum 5 5
 
 # Записываем — sloppy quorum использует spare-узел
 put y world
@@ -112,14 +118,23 @@ setWriteQuorumMode strict
 Цель: показать различие root hash, anti-entropy sync, convergence.
 
 ```
-# Записываем данные с задержкой
+# Записываем часть данных без задержки — они должны сойтись на всех репликах
 put a 1
 put b 2
 put c 3
-setReplicationDelayMs 2000 3000
+
+# Включаем большую задержку и пишем ещё — медленные REPL_WRITE останутся в полёте,
+# поэтому на части home-реплик ключей d и e ещё не будет в момент следующей проверки
+setReplicationDelayMs 5000 10000
 put d 4
 put e 5
+
+# Задержку можно убрать — уже запущенные delay-корутины это не отменит,
+# но новых задержек не будет
 setReplicationDelayMs 0 0
+
+# Сразу смотрим сырой state — у части home-реплик d/e ещё нет
+clusterDump
 
 # Merkle root — могут различаться
 showMerkleRoot H1

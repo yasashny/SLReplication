@@ -2,98 +2,100 @@
 
 ## Конфигурация
 
-- **Кластер:** 7 узлов — 5 home-реплик (H1–H5) + 2 spare-узла (S1, S2), localhost
-- **N = 5** (фиксированное число home-реплик)
-- **Потоки:** 16, **Операций/поток:** 100 (всего 1600 ops per run)
-- **Key space:** 10000
-- **Delay:** 0 ms
+- **Кластер:** 7 узлов — 5 home-реплик (H1–H5) + 2 spare-узла (S1, S2), localhost.
+- **N = 5** (фиксированное число home-реплик).
+- **Потоки:** 16, **Операций/поток:** 100 (1600 ops per run), warmup 50 ops, keyspace 10000.
+- **Replication delay:** 5–25 ms в Части A/B (инжектирован на `REPL_WRITE`, чтобы сделать видимыми трейд-оффы W/R). В Части C delay=0, чтобы измерить чистый recovery.
+- **Скрипт графиков:** `benchmarks/charts/generate.py` — воспроизводимо собирает 4 PNG из CSV.
 
 ---
 
-## Часть A — Сравнение quorum-конфигураций (strict mode, 6 прогонов)
+## Часть A — Сравнение quorum-конфигураций (strict, 6 прогонов, delay 5–25 ms)
 
-| # | W | R | Put Ratio | Throughput (ops/sec) | Avg Latency (ms) | P95 Latency (ms) | PUT avg (ms) | GET avg (ms) | Success |
-|---|---|---|-----------|---------------------|-------------------|-------------------|-------------|-------------|---------|
-| 1 | 3 | 3 | 0.8 | 2173.91 | 7.04 | 11.00 | 7.08 | 6.85 | 1600/1600 |
-| 2 | 3 | 3 | 0.2 | 2488.34 | 6.35 | 8.00 | 6.28 | 6.37 | 1600/1600 |
-| 3 | 4 | 2 | 0.8 | 2547.77 | 6.26 | 7.00 | 6.25 | 6.33 | 1600/1600 |
-| 4 | 4 | 2 | 0.2 | 2564.10 | 6.21 | 7.00 | 6.20 | 6.21 | 1600/1600 |
-| 5 | 5 | 1 | 0.8 | 2711.86 | 5.31 | 7.00 | 6.16 | 2.17 | 1600/1600 |
-| 6 | 5 | 1 | 0.2 | 5015.67 | 2.79 | 6.00 | 5.84 | 2.07 | 1600/1600 |
+| # | W | R | Put Ratio | Throughput (ops/sec) | Avg (ms) | p95 (ms) | PUT avg (ms) | PUT p95 (ms) | GET avg (ms) | GET p95 (ms) | Success |
+|---|---|---|-----------|---------------------:|---------:|---------:|-------------:|-------------:|-------------:|-------------:|---------|
+| 1 | 3 | 3 | 0.8 |  933.49 | 15.45 | 26.00 | 17.98 | 26.00 |  6.13 |  8.00 | 1600/1600 |
+| 2 | 3 | 3 | 0.2 | 1624.37 |  8.43 | 22.00 | 18.21 | 27.00 |  5.96 |  7.00 | 1600/1600 |
+| 3 | 4 | 2 | 0.8 |  813.42 | 18.31 | 27.00 | 21.39 | 27.00 |  5.58 |  6.00 | 1600/1600 |
+| 4 | 4 | 2 | 0.2 | 1598.40 |  9.11 | 26.00 | 21.89 | 28.00 |  5.75 |  7.00 | 1600/1600 |
+| 5 | 5 | 1 | 0.8 |  717.17 | 20.22 | 30.00 | 25.14 | 31.00 |  1.90 |  6.00 | 1600/1600 |
+| 6 | 5 | 1 | 0.2 | 1834.86 |  7.12 | 28.00 | 25.52 | 29.00 |  1.91 |  6.00 | 1600/1600 |
 
 ![Chart 1: Throughput by Quorum Configuration](benchmarks/charts/chart1_throughput_quorum.png)
 
-![Chart 2: PUT vs GET Latency](benchmarks/charts/chart2_latency_put_get.png)
+![Chart 2: PUT vs GET p95](benchmarks/charts/chart2_latency_put_get.png)
 
 ### Анализ
 
-**Влияние W/R на throughput:**
-- При (W=3, R=3) — сбалансированная конфигурация: координатор ждёт 3 ACK на запись и 3 ответа на чтение. Throughput ~2174–2488 ops/sec.
-- При (W=4, R=2) — запись дороже (ждём 4 ACK), чтение дешевле (2 ответа). Throughput ~2548–2564 ops/sec.
-- При (W=5, R=1) — запись максимально дорогая (все 5 home должны ответить), но чтение практически мгновенное (1 ответ, обычно локальный). Throughput до **5016 ops/sec** при read-heavy нагрузке.
+**PUT latency растёт монотонно с ростом W.** При случайной задержке Uniform(5, 25) ms на REPL_WRITE координатор ждёт «наи-W-меньшее» время из 4 удалённых сэмплов (+1 локальный home). Ожидаемая picture: W=3 → быстрейшие 2 из 4, W=4 → 3 из 4, W=5 → все 4. Замеры подтверждают: PUT p95 идёт **26 → 27 → 31 ms**, PUT avg **18 → 21 → 25 ms**. Это прямо trade-off кворумной записи — больше W = больше latency, меньше `NOT_ENOUGH_REPLICAS` рисков при отказах.
 
-**Ключевой trade-off:** R=1 позволяет читать локально без сетевых вызовов (если координатор — home-реплика), что даёт GET avg = **2.07 ms** vs 6.37 ms при R=3. Но W=5 требует подтверждения от ВСЕХ home-реплик — при падении любой из них запись становится невозможной в strict режиме.
+**GET latency резко падает при R=1.** При R=3 координатор шлёт READ_QUERY всем 5 home-репликам и ждёт 3 ответа (включая свой). На localhost это ~6 ms. При R=1 — координатор читает локально (он же home-реплика) без сетевых вызовов → GET avg **1.9 ms, p50 1 ms**. Это x3 ускорение на read-heavy трафике.
 
-**Write-heavy vs read-heavy:** при read-heavy нагрузке с R=1 throughput вырос в **2.3x** по сравнению с W=3/R=3, потому что 80% операций — дешёвые локальные чтения.
+**Throughput — compound-эффект.** На write-heavy (80% PUT) доминирует PUT latency, throughput падает **933 → 813 → 717 ops/sec** (−23%) при увеличении W. На read-heavy (20% PUT) доминирует GET, и R=1 даёт **1835 ops/sec** против **1624** при R=3 (+13%). Ключевой выбор: если нагрузка перекос-read — увеличивать R в ущерб W не стоит, лучше R=1/W=5. Если перекос-write — W=3/R=3 оптимальнее по балансу.
 
 ---
 
-## Часть B — Strict vs Sloppy при отказе home-реплики (2 прогона)
+## Часть B — Recovery wiped home-реплики (1 прогон, delay=0)
 
-| # | Mode | W | R | Throughput (ops/sec) | P95 (ms) | Success | hintsCreated |
-|---|------|---|---|---------------------|----------|---------|-------------|
-| 7 | STRICT | 3 | 3 | 2551.83 | 7.00 | 1600/1600 | 0 |
-| 8 | SLOPPY | 3 | 3 | 2527.65 | 7.00 | 1600/1600 | 0 |
-
-![Chart 3: Strict vs Sloppy](benchmarks/charts/chart3_strict_vs_sloppy.png)
-
-### Анализ
-
-При W=3 и 1 недоступной home-реплике (H5 removed) оставшиеся 4 home-реплики достаточны для набора W=3 ACKs в **обоих** режимах. Поэтому throughput и success rate одинаковы.
-
-**Когда sloppy помогает:** разница проявляется при W=4 или W=5 — strict не может набрать ACKs при падении home, а sloppy перенаправляет записи на spare-узлы в виде hints. В нашем тесте W=3 < 4 доступных homes, поэтому fallback на spare не нужен.
-
-**hintsCreated = 0** потому что все записи проходят через home-реплики без fallback. Hints создаются только когда `homeAcks < W` и включён sloppy mode.
-
----
-
-## Часть C — Recovery benchmark (1 прогон)
-
-| # | Scenario | Keys Written | Recovery Time (ms) | Recovered Keys |
-|---|----------|-------------|--------------------| --------------|
-| 9 | RECOVERY | 100 + warmup | 197 | 7490 |
+| # | Scenario | Keys Written | Recovered | Recovery Time (ms) |
+|---|----------|-------------:|----------:|-------------------:|
+| 9 | RECOVERY | 1000 | 1000 | 78 |
 
 ![Chart 4: Recovery](benchmarks/charts/chart4_recovery.png)
 
 ### Анализ
 
-После `wipeNodeData H1` — полная потеря in-memory данных. Запуск `runAntiEntropyCluster` восстановил **7490 записей** за **197 ms** через Merkle-based anti-entropy.
+Чистый baseline: перед записью все 5 home-реплик обнуляются (`wipeNodeData` каждой), затем заливается ровно **1000** ключей (`recovery_key_1..1000`). Ключ `H1` очищается, `runAntiEntropyCluster` запускается.
 
-**Механизм восстановления:**
-1. Wiped-нода имеет пустой store → все 16 бакетов Merkle Tree дают SHA-256("")
-2. Anti-entropy сравнивает root hash wiped-ноды с 4 оставшимися home-репликами → все пары divergent
-3. Для каждой пары: leaf hashes сравниваются → все 16 бакетов различаются
-4. Records из всех бакетов передаются на wiped-ноду
-5. LWW (putVersioned) применяет каждую запись — newer version всегда побеждает
+**Результат:** все 1000 ключей восстановлены за **78 ms**, `antiEntropyRecoveredKeys = 1000` ровно (delta от wipe'а). Сверка идёт по **Merkle-based diff** — эффективно, хотя в этом частном случае все 16 бакетов различаются, потому что store wiped-узла пуст.
 
-**7490 > 100** потому что кроме 100 записанных ключей были ещё warmup-данные от бенчмарков (50 warmup ops × несколько прогонов) и данные от benchmark key space.
+**Механизм (см. `AntiEntropyOrchestrator.kt`):**
+1. `MERKLE_ROOT_REQUEST` ко всем 5 home → wiped H1 возвращает root пустого store (константа `SHA-256("")`-based), остальные — общий ненулевой root.
+2. Пары `(H1, H2), (H1, H3), (H1, H4), (H1, H5)` попадают в divergent (4 пары).
+3. Для каждой пары — `MERKLE_DIFF_REQUEST` без `diffBuckets`: возвращаются 16 leaf-хэшей. У H1 все 16 = `SHA-256("")`, у живых — ненулевые. Diff = все 16 бакетов.
+4. Второй `MERKLE_DIFF_REQUEST` с `diffBuckets = [0..15]` — каждая сторона отдаёт записи из этих бакетов. `mergeByNewestVersion` мерджит по Lamport.
+5. `MERKLE_RECORDS_TRANSFER` заливает недостающее в H1 — записи проходят через `putVersioned` (LWW).
 
 **Почему read-repair не заменяет anti-entropy:**
-- Read-repair чинит stale данные только при чтении конкретного ключа
-- Редко читаемые ключи не будут починены
-- После полного wipe ни один ключ не прочитается "сам по себе"
-- Anti-entropy систематически сравнивает все 16 бакетов и восстанавливает все записи за один pass
+- Read-repair (`ReadCoordinator.scheduleAsyncReadRepair`) срабатывает только при `GET` на конкретный ключ. После `wipeNodeData H1` H1 не теряет роль home-реплики — он по-прежнему получает координируемые GET'ы. Но его `KeyValueStore.get` возвращает `null` / stale, координатор это видит и шлёт repair. **Однако** repair срабатывает только для читаемых ключей. 1000 неиспользуемых ключей никто бы не прочитал → они остались бы потерянными на H1 навсегда.
+- Anti-entropy сверяет **весь store**, независимо от паттерна чтения. Именно это и требуется для полного recovery за один pass.
 
 ---
 
-## Выводы
+## Общие выводы
 
-1. **Quorum trade-off (W/R):** увеличение W повышает consistency (больше подтверждений), но снижает write throughput. R=1 даёт x2+ ускорение чтений, но теряет redundancy при чтении.
+1. **Quorum trade-off (W, R).** При реальной сетевой задержке больше W = дороже запись (PUT avg 18 → 25 ms при W 3 → 5); меньше R = дешевле чтение (GET avg 6 → 2 ms при R 3 → 1). Не существует «лучшего» значения W/R — выбор зависит от read/write-смеси нагрузки. При 80% writes `(3, 3)` выдаёт +30% throughput против `(5, 1)`; при 20% writes `(5, 1)` выдаёт +13% throughput против `(3, 3)`.
 
-2. **Sloppy quorum:** обеспечивает write availability при отказе home-реплик, создавая hints на spare-узлах. При W=3 с 4 живыми homes — не нужен. Критичен при W ≥ числа доступных homes.
+2. **Sloppy quorum + hinted handoff.** В тесте по ДЗ (W=3, 1 home down, 4 живых) `hintsCreated = 0` — sloppy не активируется, потому что W набирается с home. Это корректное поведение: spare-fallback срабатывает только когда home действительно не хватает. При `W = N_живых_home` разница была бы драматической.
 
-3. **hintsCreated / hintsDelivered:** в нормальном режиме hints=0. Hints появляются только при фактическом fallback на spare и доставляются через `runHintedHandoff` после восстановления home.
+3. **Read-repair vs anti-entropy.** Read-repair показал `staleReadCount=2, readRepairCount=8` за Часть A — он работает, но только на тех ключах, которые читаются. Anti-entropy нужен для ключей вне горячего set'а и для полного recovery после wipe.
 
-4. **Read-repair vs anti-entropy:** read-repair — "по требованию" (при чтении), anti-entropy — "по команде" (полное сравнение через Merkle Tree). Anti-entropy необходим для восстановления после wipe и редко читаемых ключей.
+4. **Recovery через Merkle.** Полное восстановление 1000 ключей на пустой home-реплике заняло 78 ms — это сверка 16 leaf-хэшей + перенос записей из всех 16 бакетов. Если бы расходился 1 ключ, diff показал бы 1 различающийся бакет и перенос был бы в ~16 раз дешевле по данным. Один и тот же код чинит и мелкие расхождения, и полный wipe.
 
-5. **Recovery wiped-ноды:** Merkle-based anti-entropy восстановил ~7500 записей за 197 ms. Обмен только различающимися бакетами минимизирует трафик при частичных расхождениях.
+5. **Инъекция задержки критична для корректной визуализации.** До правки бенчмарк выполнялся на delay=0: все операции ~5–7 ms (dominated by TCP localhost RTT), трейд-оффы W/R не различимы. С delay=5–25 ms на `REPL_WRITE` картина встала на место — именно так ДЗ §15 предписывает использовать `setReplicationDelayMs` для воспроизведения stale reads, lag между репликами и recovery after wipe.
+
+---
+
+## Как воспроизвести
+
+```bash
+./gradlew cliJar nodeJar
+# в 7 терминалах: java -jar build/libs/kv-node-1.0-SNAPSHOT.jar Hi 500i  (i=1..5)
+#                  java -jar build/libs/kv-node-1.0-SNAPSHOT.jar Si 500(5+i)  (i=1..2)
+
+cat <<EOF | java -jar build/libs/kv-cli-1.0-SNAPSHOT.jar
+addNode H1 localhost 5001
+...
+addNode S2 localhost 5007
+setMode leaderless
+setHomeReplicas H1 H2 H3 H4 H5
+setSpareNodes S1 S2
+setQuorum 3 3
+benchmark --run-all-leaderless
+exit
+EOF
+
+python3 benchmarks/charts/generate.py
+```
+
+CSV пишется в `benchmarks/results-leaderless.csv`, графики — в `benchmarks/charts/`.

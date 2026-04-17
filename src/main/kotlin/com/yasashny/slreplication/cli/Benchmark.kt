@@ -5,6 +5,7 @@ import com.yasashny.slreplication.common.model.LeaderlessPayload
 import kotlinx.coroutines.*
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
@@ -266,6 +267,7 @@ private fun runAllLeaderlessBenchmarks(manager: ClusterManager, threads: Int, op
     if (spareNodes.size == 2) manager.setSpareNodes(spareNodes)
 
     manager.setWriteQuorumMode(WriteQuorumMode.STRICT)
+    manager.setReplicationDelay(5, 25)
 
     for ((w, r) in listOf(3 to 3, 4 to 2, 5 to 1)) {
         manager.setQuorum(w, r)
@@ -318,9 +320,15 @@ private fun runAllLeaderlessBenchmarks(manager: ClusterManager, threads: Int, op
     println("=== Part C: Recovery benchmark ===")
     manager.setWriteQuorumMode(WriteQuorumMode.STRICT)
     manager.setQuorum(3, 3)
+    manager.setReplicationDelay(0, 0)
 
-    println("  Writing 100 keys...")
-    for (i in 1..100) {
+    val recoveryKeys = 1000
+    println("  Resetting home replicas for clean recovery baseline...")
+    for (id in homeReplicas) manager.wipeNodeData(id)
+    Thread.sleep(500)
+
+    println("  Writing $recoveryKeys keys...")
+    for (i in 1..recoveryKeys) {
         manager.put("recovery_key_$i", "value_$i")
     }
     Thread.sleep(2000)
@@ -330,22 +338,24 @@ private fun runAllLeaderlessBenchmarks(manager: ClusterManager, threads: Int, op
     manager.wipeNodeData(wipeTarget)
     Thread.sleep(500)
 
+    val statsBefore = manager.getLeaderlessStats()
+    val recoveredBefore = statsBefore["antiEntropyRecoveredKeys"] ?: 0L
     val recoveryStart = System.currentTimeMillis()
     val aeResult = manager.runAntiEntropyCluster()
     val recoveryTimeMs = System.currentTimeMillis() - recoveryStart
+    val statsAfter = manager.getLeaderlessStats()
+    val recoveredDelta = (statsAfter["antiEntropyRecoveredKeys"] ?: 0L) - recoveredBefore
 
     println("  Recovery time: ${recoveryTimeMs}ms")
     aeResult.onSuccess { println("  $it") }
     aeResult.onFailure { println("  Error: ${it.message}") }
-
-    val recoveryStats = manager.getLeaderlessStats()
-    println("  Recovery stats: $recoveryStats")
+    println("  Recovered keys (delta): $recoveredDelta")
     println()
 
     results.add(BenchmarkResult(
         replicationMode = "RECOVERY",
         rf = 5, k = 0, threads = 1, putRatio = 0.0,
-        totalOps = 100, successfulOps = 100, failedOps = 0,
+        totalOps = recoveryKeys, successfulOps = recoveredDelta.toInt(), failedOps = 0,
         durationMs = recoveryTimeMs,
         throughputOpsSec = 0.0,
         avgMs = recoveryTimeMs.toDouble(), p50Ms = 0.0, p75Ms = 0.0, p95Ms = 0.0, p99Ms = 0.0,
@@ -353,7 +363,7 @@ private fun runAllLeaderlessBenchmarks(manager: ClusterManager, threads: Int, op
         getAvgMs = 0.0, getP50Ms = 0.0, getP95Ms = 0.0,
         mode = "LEADERLESS",
         convergenceTimeMs = recoveryTimeMs,
-        keySpace = 100
+        keySpace = recoveryKeys
     ))
 
     saveResults(results, outputFile)
@@ -523,15 +533,16 @@ private fun saveResults(results: List<BenchmarkResult>, filename: String) {
             "durationMs,throughputOpsSec,avgMs,p50Ms,p75Ms,p95Ms,p99Ms," +
             "putAvgMs,putP50Ms,putP95Ms,getAvgMs,getP50Ms,getP95Ms,convergenceTimeMs"
 
+    fun f(x: Double): String = String.format(Locale.US, "%.2f", x)
     val lines = results.map { r ->
         "${r.mode},${r.topology},${r.replicationMode},${r.rf},${r.k},${r.threads},${r.putRatio}," +
                 "${r.keySpace},${r.totalOps},${r.successfulOps},${r.failedOps},${r.durationMs}," +
-                "${"%.2f".format(r.throughputOpsSec)},${"%.2f".format(r.avgMs)}," +
-                "${"%.2f".format(r.p50Ms)},${"%.2f".format(r.p75Ms)}," +
-                "${"%.2f".format(r.p95Ms)},${"%.2f".format(r.p99Ms)}," +
-                "${"%.2f".format(r.putAvgMs)},${"%.2f".format(r.putP50Ms)}," +
-                "${"%.2f".format(r.putP95Ms)},${"%.2f".format(r.getAvgMs)}," +
-                "${"%.2f".format(r.getP50Ms)},${"%.2f".format(r.getP95Ms)},${r.convergenceTimeMs}"
+                "${f(r.throughputOpsSec)},${f(r.avgMs)}," +
+                "${f(r.p50Ms)},${f(r.p75Ms)}," +
+                "${f(r.p95Ms)},${f(r.p99Ms)}," +
+                "${f(r.putAvgMs)},${f(r.putP50Ms)}," +
+                "${f(r.putP95Ms)},${f(r.getAvgMs)}," +
+                "${f(r.getP50Ms)},${f(r.getP95Ms)},${r.convergenceTimeMs}"
     }
 
     file.writeText(header + "\n" + lines.joinToString("\n"))
